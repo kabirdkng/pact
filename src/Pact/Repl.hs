@@ -93,14 +93,12 @@ import Pact.Gas
 import Pact.JSON.Legacy.Value
 import qualified Pact.Utils.StableHashMap as SHM
 
--- | for use in GHCI
 repl :: IO (Either () (Term Name))
 repl = repl' Interactive
 
 repl' :: ReplMode -> IO (Either () (Term Name))
 repl' m = initReplState m Nothing >>= \s -> runPipedRepl' (m == Interactive) s stdin
 
--- | Repl that doesn't die on normal errors
 _repl :: IO ()
 _repl = forever $ repl
 
@@ -177,10 +175,10 @@ toUTF8Bytes = BS.unpack . encodeUtf8 . pack
 utf8BytesLength :: String -> Int
 utf8BytesLength = length . toUTF8Bytes
 
--- | Main loop for non-interactive (piped) input
 pipeLoop :: Bool -> Handle -> Maybe (Term Name) -> Repl (Either () (Term Name))
 pipeLoop prompt h lastResult = do
-  when prompt $ outStr HOut "pact> "
+  when prompt $ outStr HOut $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+    annotate Keyword "pact" <> annotate Operator "> "
   isEof <- liftIO (hIsEOF h)
   let retVal = maybe rSuccess (return.Right) lastResult
   if isEof then retVal else do
@@ -191,7 +189,8 @@ pipeLoop prompt h lastResult = do
            errToUnit $ parsedCompileEval line $ TF.parseString exprsOnly d line
     case r of
       Left _ -> do
-        outStrLn HErr "Aborting execution"
+        outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+          annotate Error "Aborting execution"
         return r
       Right t -> pipeLoop prompt h (Just t)
 
@@ -206,13 +205,10 @@ handleParse :: TF.Result [Exp Parsed] -> ([Exp Parsed] -> Repl (Either String a)
 handleParse (TF.Failure e) _ = do
   mode <- use rMode
   let errDoc = docToInternal (_errDoc e)
-  outStrLn HErr $ renderPrettyString' (colors mode) $ unAnnotate errDoc
-  return $ Left $ renderCompactString' $ unAnnotate $ errDoc
+  outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+    annotate Error (pretty errDoc)
+  return $ Left $ renderCompactString' $ unAnnotate errDoc
 handleParse (TF.Success es) a = a es
-
-colors :: ReplMode -> RenderColor
-colors Interactive = RColor
-colors _ = RPlain
 
 parsedCompileEval :: String -> TF.Result [Exp Parsed] -> Repl (Either String (Term Name))
 parsedCompileEval src r = do
@@ -220,28 +216,37 @@ parsedCompileEval src r = do
       fc _ exp = compileEval src exp
   handleParse r $ \es -> foldM fc (Right (toTerm True)) es
 
-
 handleCompile :: String -> Exp Parsed -> (Term Name -> Repl (Either String a)) -> Repl (Either String a)
 handleCompile src exp a =
     case compile def (mkStringInfo src) exp of
       Right t -> a t
-      -- special case for `with-capability` bareword due to
-      -- `with-capability` being a reserved word that fails to
-      -- compile if issued in the repl for doc purposes
       Left{} | "with-capability" == (exp ^. _EAtom . to _atomAtom) ->
           a $ TVar (Name (BareName "with-capability" def)) def
       Left er -> do
           case _iInfo (peInfo er) of
             Just (_,d) -> do
-                        mode <- use rMode
-                        outStr HErr (renderPrettyString (colors mode) (_pDelta d))
-                        outStrLn HErr $ ": error: " ++ renderCompactString' (peDoc er)
-            Nothing -> outStrLn HErr $ "[No location]: " ++ renderCompactString' (peDoc er)
+              outStr HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+                annotate Error (pretty $ _pDelta d)
+              outStrLn HErr $ ": error: " ++ renderCompactString' (peDoc er)
+            Nothing -> outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+              annotate Error ("[No location]: " <> pretty (peDoc er))
           Left <$> renderErr er
 
 compileEval :: String -> Exp Parsed -> Repl (Either String (Term Name))
 compileEval src exp = handleCompile src exp $ \e -> pureEval (_tInfo e) (eval e)
 
+colorize :: Term Name -> Doc Annot
+colorize = \case
+    TLiteral (LString s) _ -> annotate StringLit (pretty s)
+    TLiteral (LInteger n) _ -> annotate NumberLit (pretty n)
+    TLiteral (LDecimal d) _ -> annotate NumberLit (pretty d)
+    TLiteral (LBool b) _ -> annotate Special (pretty b)
+    TVar n _ -> annotate Variable (pretty n)
+    TConst n _ -> annotate Special (pretty n)
+    TModule n _ -> annotate ModuleName (pretty n)
+    TList ts _ -> annotate Delimiter (list (map colorize ts))
+    TDef n _ -> annotate Function (pretty n)
+    t -> pretty t
 
 pureEval :: Info -> Eval LibState (Term Name) -> Repl (Either String (Term Name))
 pureEval ei e = do
@@ -249,25 +254,26 @@ pureEval ei e = do
   mode <- use rMode
   case r of
     Right a -> do
-        wref <- use (rEnv . eeWarnings)
-        warnings <- liftIO $ readIORef wref
-        traverse_ (outStrLn HOut . renderCompactString) warnings
-        liftIO $ writeIORef wref mempty
-        doOut ei mode a
-        rEvalState .= es
-        updateForOp ei a
+      wref <- use (rEnv . eeWarnings)
+      warnings <- liftIO $ readIORef wref
+      traverse_ (outStrLn HOut . renderString' (layoutPretty defaultLayoutOptions) RColor . 
+                annotate Warning . pretty) warnings
+      liftIO $ writeIORef wref mempty
+      doOut ei mode a
+      rEvalState .= es
+      updateForOp ei a
     Left err -> do
-        serr <- renderErr err
-        if mode == FailureTest || mode == StringEval
-          then return (Left serr)
-          else do
-            let cs = peCallStack err
-            if null cs
-              then outStrLn HErr serr
-              else do
-              outStrLn HErr serr
-              mapM_ (\c -> outStrLn HErr $ " at " ++ show c) cs
-            return (Left serr)
+      serr <- renderErr err
+      if mode == FailureTest || mode == StringEval
+        then return (Left serr)
+        else do
+          let cs = peCallStack err
+          outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+            annotate Error (pretty serr)
+          unless (null cs) $
+            forM_ cs $ \c -> outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+              annotate Warning (" at " <> pretty c)
+          return (Left serr)
 
 evalEval :: Info -> Eval LibState a -> Repl (Either PactError a, EvalState)
 evalEval ei e = do
@@ -279,17 +285,19 @@ evalEval ei e = do
 
 doOut :: Info -> ReplMode -> Term Name -> Repl ()
 doOut ei mode a = case mode of
-  Interactive -> plainOut
+  Interactive -> colorOut
   StringEval -> rTermOut %= (a:)
-  StdinPipe -> plainOut
+  StdinPipe -> colorOut
   Script True _ -> lineOut
   _ -> return ()
   where
-    plainOut = outStrLn HOut $ show $ pretty a
-    lineOut = outStrLn HErr $ renderInfo ei ++ ":Trace: " ++
+    colorOut = outStrLn HOut $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+               colorize a
+    lineOut = outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+      annotate Header (pretty $ renderInfo ei) <> ":Trace: " <>
       case a of
-        TLiteral (LString t) _ -> unpack t
-        _ -> renderCompactString a
+        TLiteral (LString t) _ -> pretty (unpack t)
+        _ -> colorize a
 
 renderErr :: PactError -> Repl String
 renderErr a
@@ -312,21 +320,20 @@ updateForOp i a = do
       rEnv %= appEndo e
       return (Right a)
     Load fp reset -> do
-                  when reset $ do
-                    replState <- liftIO $ readMVar mv
-                    let verifyUri = _rlsVerifyUri replState
-                    (initReplState mode verifyUri >>= put >> void useReplLib)
-                  (a <$) <$> loadFile i fp
-    Output es -> forM_ es (outStrLn HErr . renderPrettyString RColor) >> return (Right a)
+      when reset $ do
+        replState <- liftIO $ readMVar mv
+        let verifyUri = _rlsVerifyUri replState
+        (initReplState mode verifyUri >>= put >> void useReplLib)
+      (a <$) <$> loadFile i fp
+    Output es -> forM_ es (outStrLn HErr . renderString' (layoutPretty defaultLayoutOptions) RColor . pretty) >> 
+                return (Right a)
     Print t -> do
-      let rep = case t of TLitString s -> unpack s
-                          _ -> showPretty t
+      let rep = case t of 
+            TLitString s -> unpack s
+            _ -> renderString' (layoutPretty defaultLayoutOptions) RColor $ colorize t
       outStrLn HOut rep
       return (Right a)
 
-
--- | load and evaluate a Pact file.
--- Track file and use current file to mangle directory as necessary.
 loadFile :: Info -> FilePath -> Repl (Either String (Term Name))
 loadFile i f = do
   curFileM <- use rFile
@@ -352,7 +359,8 @@ loadFile i f = do
                pe <- renderErr $
                  PactError EvalError i def $
                  "load: file load failed: " <> pretty f <> ", " <> viaShow e
-               outStrLn HErr pe
+               outStrLn HErr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+                 annotate Error (pretty pe)
                return (Left (show e))
 
 out :: ReplMode -> Hdl -> Bool -> String -> Repl ()
@@ -365,21 +373,18 @@ out m hdl newline str =
            (if newline then hPutStrLn else hPutStr) h str
            hFlush h
 
-
 outStr :: Hdl -> String -> Repl ()
 outStr h s = use rMode >>= \m -> out m h False s
+
 outStrLn :: Hdl -> String -> Repl ()
 outStrLn h s = use rMode >>= \m -> out m h True s
-
 
 trim :: String -> String
 trim = dropWhileEnd isSpace . dropWhile isSpace
 
-
 rSuccess :: Monad m => m (Either a (Term Name))
 rSuccess = return $ Right $ toTerm True
 
--- | Workhorse to load script; also checks/reports test failures
 execScript :: Bool -> FilePath -> IO (Either () (Term Name))
 execScript dolog f = execScriptF dolog f id
 
@@ -392,7 +397,8 @@ execScriptF dolog f stateMod = do
         fmap sequence $ forM _rlsTests $ \TestResult{..} -> case trFailure of
           Nothing -> return (Just ())
           Just (i,e) -> do
-            hPutStrLn stderr $ renderInfo (_faInfo i) ++ ":ExecError: " ++ unpack e
+            hPutStrLn stderr $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+              annotate Error (pretty $ renderInfo (_faInfo i) <> ":ExecError: " <> pretty (unpack e))
             return Nothing
   case r of
     Left _ -> outFailures >> return (Left ())
@@ -400,7 +406,6 @@ execScriptF dolog f stateMod = do
       fs <- outFailures
       maybe (return $ Left ()) (const (return (Right t))) fs
 
--- | Version with state result
 execScript' :: ReplMode -> FilePath -> IO (Either String (Term Name),ReplState)
 execScript' m fp = execScriptF' m fp id
 
@@ -415,8 +420,6 @@ execScriptState' :: FilePath -> ReplState -> (ReplState -> ReplState)
 execScriptState' fp initState stateMod =
   runStateT (useReplLib >> modify stateMod >> loadFile def fp) initState
 
-
--- | Run an 'Eval' in repl.
 evalReplEval :: Info -> ReplState -> Eval LibState a -> IO (Either PactError (a, ReplState))
 evalReplEval i rs e = do
   ((r,es),rs') <- runStateT (evalEval i e) rs
@@ -436,44 +439,24 @@ replLookupModule rs mn = do
     Left err -> Left $ show err
     Right (modules,_) ->
       case HM.lookup mn modules of
-        Nothing         -> Left $ "module not found: " ++ show mn ++ ", modules=" ++ show (HM.keys modules)
+        Nothing -> Left $ renderString' (layoutPretty defaultLayoutOptions) RColor $
+                  annotate Error ("Module not found: " <> pretty mn <> ", modules=" <> pretty (HM.keys modules))
         Just moduleData -> Right moduleData
 
--- | install repl lib functions into monad state
 useReplLib :: Repl ()
 useReplLib = id %= setReplLib
 
--- | mutate repl state to install lib functions
 setReplLib :: ReplState -> ReplState
 setReplLib = over (rEvalState.evalRefs.rsLoaded) $ SHM.union replDefsMap
 
--- | mutate repl state to remove lib functions
 unsetReplLib :: ReplState -> ReplState
 unsetReplLib = over (rEvalState.evalRefs.rsLoaded) (`SHM.difference` replDefsMap)
 
--- | evaluate string in repl monad
 evalPact :: String -> Repl (Either String (Term Name))
 evalPact cmd = parsedCompileEval cmd (TF.parseString exprsOnly mempty cmd)
 
--- | evaluate string in repl monad, loading lib functions first.
 evalRepl' :: String -> Repl (Either String (Term Name))
 evalRepl' cmd = useReplLib >> evalPact cmd
 
 evalRepl :: ReplMode -> String -> IO (Either String (Term Name))
 evalRepl m cmd = initReplState m Nothing >>= evalStateT (evalRepl' cmd)
-
-_eval :: String -> IO (Term Name)
-_eval cmd = evalRepl (Script True "_eval") cmd >>= \r ->
-            case r of Left e -> throwM (userError $ " Failure: " ++ show e); Right v -> return v
-
-_run :: String -> IO ()
-_run cmd = void $ evalRepl Interactive cmd
-
-_testAccounts :: IO ()
-_testAccounts = void $ execScript False "examples/accounts/accounts.repl"
-
-_testBench :: IO ()
-_testBench = void $ execScript False "tests/bench/bench"
-
-_testCP :: IO ()
-_testCP = void $ execScript False "examples/cp/cp.repl"
